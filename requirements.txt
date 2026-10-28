@@ -1,0 +1,20 @@
+# Python 3.10-3.12. Seed-VC source must also be checked out; see README.md.
+# Core versions follow Seed-VC's v1 inference requirements.
+numpy==1.26.4
+scipy==1.13.1
+librosa==0.10.2
+soundfile==0.12.1
+torch==2.4.0
+torchaudio==2.4.0
+torchvision==0.19.0
+transformers==4.46.3
+huggingface-hub>=0.28.1,<1.0
+PyYAML>=6.0,<7
+munch==4.0.0
+einops==0.8.0
+descript-audio-codec==1.0.0
+matplotlib>=3.7,<4
+tqdm>=4.66,<5
+# Default gibberish / --lyrics workflow.
+kokoro==0.9.4
+misaki[en]>=0.9.4,<1
