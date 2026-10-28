@@ -12,6 +12,8 @@ with your own file in place of `input.wav`:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+
+# Download the Seed-VC code that Cacofonix uses
 git clone https://github.com/Plachtaa/seed-vc.git .seedvc_runtime/seed-vc
 
 # Make five versions of the first 15 seconds
@@ -30,6 +32,10 @@ Cacofonix saves the results in a new folder next to your audio file, named with 
 date and time. You'll find five WAV files, a copy of your original recording, and
 JSON reports with the settings and timing scores. Add `--count 1` if you only want
 one version, or `--seed 12345` to use the same melody choices when you run it again.
+
+Each version also gets a `lyricsonly_` WAV file: the same gibberish sung on the
+original melody, so you can hear the new words without the new tune. Add
+`--no-lyrics-only` to skip these files.
 
 ## Architecture
 
@@ -58,9 +64,10 @@ one version, or `--seed 12345` to use the same melody choices when you run it ag
 ```
 
 Cacofonix changes the tune and replaces the words with gibberish that should look
-similar on the singer's lips. Kokoro speaks the new words, and Cacofonix adjusts
-their timing to match the original before Seed-VC sings them in the original
-singer's voice. If you use `--keep-lyrics`, it keeps the words and skips the Kokoro
+similar on the singer's lips. It swaps sounds such as `m` for `b` or `p`, keeping
+sounds that have no suitable replacement. Kokoro speaks the new words, and
+Cacofonix adjusts their timing to match the original before Seed-VC sings them in
+the original singer's voice. If you use `--keep-lyrics`, it keeps the words and skips the Kokoro
 step. It then reduces noise and checks how closely the sounds and timing match.
 The lip-sync score comes from the audio alone, so you'll still need to watch the
 video to judge how well the lips match.

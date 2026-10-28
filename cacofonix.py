@@ -110,9 +110,20 @@ def note_name(midi: float) -> str:
 _RMVPE = None
 
 
+def require_seedvc_source():
+    if not (SEEDVC / "modules" / "rmvpe.py").is_file():
+        raise SystemExit(
+            f"Cacofonix needs the Seed-VC source at {SEEDVC}.\n"
+            "Installing requirements.txt does not download it. Run:\n"
+            f'  git clone https://github.com/Plachtaa/seed-vc.git "{SEEDVC}"\n'
+            "Then run Cacofonix again."
+        )
+
+
 def load_rmvpe(device):
     global _RMVPE
     if _RMVPE is None:
+        require_seedvc_source()
         from huggingface_hub import hf_hub_download
         from modules.rmvpe import RMVPE
         path = hf_hub_download("lj1995/VoiceConversionWebUI", "rmvpe.pt")
@@ -386,6 +397,7 @@ def build_f0(f0: np.ndarray, notes: list[Note], glide_s: float = 0.055) -> np.nd
 # ------------------------------------------------------------------- synthesis
 
 def load_seedvc(device):
+    require_seedvc_source()
     import torch
     import yaml
     from huggingface_hub import hf_hub_download
@@ -883,6 +895,17 @@ def _group(c: str) -> str:
     return next((g for g in VOWEL_GROUPS + CONS_GROUPS if c in g), c)
 
 
+def replacement_phones(phone: str) -> list[str]:
+    """Prefer distinct sounds over reduced vowels and allophonic variants."""
+    # Prefer a larger change within the same mouth shape: avoid reduced-vowel
+    # swaps and choose n instead of a t/d/flap swap when it is available.
+    nearby_variants = ("ʌəɐᵊ", "ɪᵻ", "ɜɚ", "tdɾ")
+    alternatives = [p for p in _group(phone) if p != phone]
+    preferred = [p for p in alternatives if p not in "əɐᵻɾɚ"
+                 and not any(phone in group and p in group for group in nearby_variants)]
+    return preferred
+
+
 def _phone_units(ph: str):
     units, stress = [], ""
     for ch in ph:
@@ -931,16 +954,12 @@ def gibberize(orig_text: str, rng, return_details=False):
                      f"({ph}); hyphenate it in --orig-lyrics to match how it is sung")
         new_syl = []
         for s in syl:
-            changeable = any(len(_group(c)) > 1 for c, _ in s)
-            for _ in range(30):
-                ns = []
-                for c, st in s:
-                    g = _group(c)
-                    if len(g) > 1 and (c in VOWEL_SET or rng.random() < 0.7):
-                        c = str(rng.choice([x for x in g if x != c]))
-                    ns.append((c, st))
-                if ns != s or not changeable:
-                    break
+            ns = []
+            for c, st in s:
+                alternatives = replacement_phones(c)
+                if alternatives:
+                    c = str(rng.choice(alternatives))
+                ns.append((c, st))
             new_syl.append(ns)
             for (old, _), (new, _) in zip(s, ns):
                 old_viseme = viseme_of(aliases.get(old, old))
@@ -1169,7 +1188,8 @@ def cmd_render(args, bundle=None, source_audio=None, source_phones=None):
     f0 = extract_f0(piece, device)
 
     if args.baseline:
-        f0_new, notes, label = f0.copy(), [], "baseline"
+        f0_new, notes = f0.copy(), []
+        label = getattr(args, "baseline_label", None) or "baseline"
     else:
         plan = json.loads(Path(args.plan).read_text())
         notes = [Note(**n) for n in plan["notes"]]
@@ -1425,6 +1445,19 @@ def cmd_run(args):
             metadata["outputs"].append(result)
             metadata["completed_count"] = len(metadata["outputs"])
             save_metadata()
+            if args.lyrics and not args.baseline and args.lyrics_only:
+                # Same seed gives the same new words, sung on the original melody.
+                print(f"\n[{index}/{args.count}] seed {seed}: new words, original melody")
+                plan_path = args.plan
+                args.baseline, args.plan = True, None
+                args.baseline_label = f"lyricsonly_{index:02d}"
+                try:
+                    extra = cmd_render(args, bundle=bundle, source_audio=audio,
+                                       source_phones=source_phones)
+                finally:
+                    args.baseline, args.plan, args.baseline_label = False, plan_path, None
+                result["lyrics_only"] = extra
+                save_metadata()
         metadata["source_unchanged"] = sha256(src) == digest
         metadata["status"] = "complete"
         metadata["finished_at"] = datetime.now().astimezone().isoformat()
@@ -1526,6 +1559,9 @@ def main(argv=None):
     q = sub.add_parser("run", help="plan + render in one go (default command)")
     q.add_argument("input", nargs="?", help="sung vocal to recompose (wav/flac/mp3...)")
     q.add_argument("--count", type=int, default=5, help="number of variations (default: 5)")
+    q.add_argument("--no-lyrics-only", dest="lyrics_only", action="store_false",
+                   help="skip the extra file per variation with the new words on the "
+                        "original melody")
     render_opts(q)
     q.set_defaults(func=cmd_run, lyrics="auto")
 

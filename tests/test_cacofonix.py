@@ -14,6 +14,19 @@ import cacofonix as c
 import visemes as v
 
 
+class SetupChecks(unittest.TestCase):
+    def test_missing_seedvc_explains_setup_for_both_loaders(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(c, "SEEDVC", Path(folder) / "seed-vc"), \
+                patch.object(c, "_RMVPE", None):
+            for loader in (c.load_rmvpe, c.load_seedvc):
+                with self.subTest(loader=loader.__name__):
+                    with self.assertRaises(SystemExit) as error:
+                        loader("cpu")
+                    self.assertIn("git clone", str(error.exception))
+                    self.assertIn(str(c.SEEDVC), str(error.exception))
+
+
 class AudioChecks(unittest.TestCase):
     def test_cleanup_reduces_silence_noise_preserves_active_sound_and_length(self):
         rng = np.random.default_rng(11)
@@ -85,6 +98,7 @@ class BatchChecks(unittest.TestCase):
 
     def run_batch(self, *extra, failure=False):
         before = set(self.out.iterdir())
+        replacement_content = object()
         fake_audio = lambda *a, **kw: (self.audio.copy(), 344, 344)
         onsets = np.random.default_rng(5).random(344)
         capture = io.StringIO()
@@ -94,7 +108,7 @@ class BatchChecks(unittest.TestCase):
             for i, p in enumerate(["b", "æ", "t"] * 3)]}
 
         def fake_lyrics(piece, f0, notes, old, new, *args, **kwargs):
-            return None, f0, {"tts_seconds": 2.0, "syllables": [
+            return replacement_content, f0, {"tts_seconds": 2.0, "syllables": [
                 {"orig": "bat", "new": "pat", "orig_vowel": 0.2}]}
 
         with contextlib.redirect_stdout(capture), \
@@ -112,7 +126,7 @@ class BatchChecks(unittest.TestCase):
                 patch.object(c, "match_envelope", side_effect=lambda wave, *a, **kw: wave), \
                 patch.object(c, "synthesise", side_effect=(
                     [(self.audio.copy(), 344, 344), RuntimeError("test render failure")]
-                    if failure else fake_audio)):
+                    if failure else fake_audio)) as synthesis:
             command = [str(self.source), "--output-dir", str(self.out), *extra]
             if failure:
                 with self.assertRaisesRegex(RuntimeError, "test render failure"):
@@ -120,6 +134,9 @@ class BatchChecks(unittest.TestCase):
             else:
                 c.main(command)
             self.assertEqual(loader.call_count, 1)
+            for call in synthesis.call_args_list:
+                self.assertIs(call.kwargs["content"],
+                              None if "--keep-lyrics" in extra else replacement_content)
         folder, = set(self.out.iterdir()) - before
         return folder, json.loads((folder / "metadata.json").read_text()), capture.getvalue()
 
@@ -132,7 +149,7 @@ class BatchChecks(unittest.TestCase):
         self.assertEqual(len(set(meta["variant_seeds"])), 5)
         self.assertEqual((folder / meta["source_copy"]).read_bytes(), self.original_bytes)
         self.assertEqual(self.source.read_bytes(), self.original_bytes)
-        self.assertEqual(len(list(folder.glob("*.wav"))), 6)
+        self.assertEqual(len(list(folder.glob("*.wav"))), 11)  # 5 + 5 lyrics-only + copy
         self.assertIn(f"Generated 5 mangled melodies in {folder.resolve()}", log)
         self.assertEqual(meta["settings"]["steps"], 50)
         self.assertEqual(meta["settings"]["lyrics"], "auto")
@@ -147,6 +164,18 @@ class BatchChecks(unittest.TestCase):
             samples, sample_rate = sf.read(folder / output["output"])
             self.assertEqual(len(samples), len(self.audio))
             self.assertEqual(sample_rate, c.SR)
+            extra = output["lyrics_only"]
+            self.assertIn("lyricsonly_", extra["output"])
+            self.assertEqual(extra["seed"], output["seed"])
+            self.assertEqual(extra["lyrics"]["new_text"], output["lyrics"]["new_text"])
+            self.assertTrue((folder / extra["output"]).is_file())
+
+    def test_lyrics_only_can_be_disabled_and_is_skipped_when_words_are_kept(self):
+        for option in ("--no-lyrics-only", "--keep-lyrics"):
+            with self.subTest(option=option):
+                folder, meta, _ = self.run_batch(option, "--count", "1")
+                self.assertNotIn("lyrics_only", meta["outputs"][0])
+                self.assertEqual(len(list(folder.glob("*.wav"))), 2)
 
     def test_seed_repeats_plans_and_runs_never_overwrite(self):
         folder1, first, _ = self.run_batch("--seed", "0", "--count", "2")
@@ -182,6 +211,34 @@ class BatchChecks(unittest.TestCase):
 
 
 class VisemeChecks(unittest.TestCase):
+    def test_replacements_change_every_eligible_sound_without_allophone_only_swaps(self):
+        phones = {"don't": "dˈOnt", "love": "lˈʌv", "me": "mˈi", "you": "ju"}
+        with patch.object(c, "kokoro_pipe", return_value=SimpleNamespace(
+                g2p=lambda word: (phones[word], None))):
+            for seed in range(20):
+                _, output, _, plan = c.gibberize(
+                    "don't love me you", np.random.default_rng(seed), return_details=True)
+                self.assertTrue(plan["planned_visemes_preserved"])
+                self.assertNotIn("ɾ", output)
+                self.assertNotIn("ᵻ", output)
+                for change in plan["substitutions"]:
+                    old, new = change["original"], change["replacement"]
+                    if c.replacement_phones(old):
+                        self.assertNotEqual(old, new)
+                self.assertIn("lˈæf", output)
+                self.assertTrue(output.endswith("ju"))  # No safe alternative.
+
+    def test_tts_uses_replacement_phonemes_instead_of_display_spelling(self):
+        from unittest.mock import Mock
+        pipe = Mock()
+        pipe.generate_from_tokens.return_value = [SimpleNamespace(
+            audio=SimpleNamespace(numpy=lambda: np.ones(2400, dtype=np.float32)))]
+        with patch.object(c, "kokoro_pipe", return_value=pipe):
+            wave = c.tts_speak("baf", "af_heart", 0.85, phonemes="bˈæf")
+        pipe.generate_from_tokens.assert_called_once_with("bˈæf", voice="af_heart", speed=0.85)
+        pipe.assert_not_called()
+        self.assertEqual(len(wave), 2400 + 2 * 7200)
+
     @staticmethod
     def recording(phones, shift=0, confidence=0.95):
         return {"duration_s": 3.0, "events": [
