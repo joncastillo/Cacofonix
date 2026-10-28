@@ -739,12 +739,19 @@ def tts_speak(text: str, voice: str, speed: float, phonemes: str | None = None) 
 
 def transcribe(audio44k: np.ndarray, device) -> str:
     import librosa
-    from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition", model="openai/whisper-small",
-                   device=0 if device.type == "cuda" else -1)
+    import torch
+    from transformers import AutoProcessor, WhisperForConditionalGeneration
+    name = "openai/whisper-small"
+    processor = AutoProcessor.from_pretrained(name)
+    model = WhisperForConditionalGeneration.from_pretrained(name).to(device).eval()
+    model.generation_config.forced_decoder_ids = None
+    model.config.forced_decoder_ids = None
     a16 = librosa.resample(audio44k, orig_sr=SR, target_sr=16000)
-    return asr({"raw": a16, "sampling_rate": 16000},
-               generate_kwargs={"language": "en", "task": "transcribe"})["text"].strip()
+    features = processor.feature_extractor(a16, sampling_rate=16000,
+                                           return_tensors="pt").input_features.to(device)
+    with torch.inference_mode():
+        tokens = model.generate(input_features=features, language="en", task="transcribe")
+    return processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
 
 
 def lyrics_conditioning(piece44k, f0_plan, notes, orig_text, new_text, voice, speed,
@@ -1203,6 +1210,8 @@ def cmd_render(args, bundle=None, source_audio=None, source_phones=None):
         notes = kept
         f0_new = build_f0(f0, notes, glide_s=args.glide)
         label = Path(args.plan).stem.removeprefix(f"{src.stem}_")
+        if getattr(args, "melody_only_label", None):
+            label = args.melody_only_label
 
     r0 = int(round(args.ref_start * SR))
     r1 = len(audio) if args.ref_dur <= 0 else min(len(audio),
@@ -1358,6 +1367,10 @@ def cmd_run(args):
     if (s1 - s0 + HOP - 1) // HOP + (r1 - r0) // HOP > SR // HOP * 30:
         raise ValueError("Source plus reference exceeds the model's 30 s context. "
                          "Select a shorter --dur or --ref-dur (e.g. --dur 20 --ref-dur 8).")
+    source_phones = recognize_phonemes(audio[s0:s1], SR) if args.viseme_check else None
+    if args.lyrics and not args.orig_lyrics:
+        args.orig_lyrics = transcribe(audio[s0:s1], _device())
+    bundle = load_seedvc(_device())
     created = datetime.now().astimezone()
     parent = Path(args.output_dir).resolve() if args.output_dir else src.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -1397,6 +1410,8 @@ def cmd_run(args):
         "outputs": [],
     }
     def save_metadata():
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Output folder disappeared during the run: {folder}")
         tmp = folder / "metadata.json.tmp"
         tmp.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         tmp.replace(folder / "metadata.json")
@@ -1410,16 +1425,12 @@ def cmd_run(args):
     args.source = str(source_copy)
     args.export_reference_excerpt = False
     try:
-        source_phones = recognize_phonemes(audio[s0:s1], SR) if args.viseme_check else None
         if source_phones is not None:
             write_exclusive(folder / "source_phonemes.json",
                             json.dumps(source_phones, indent=2).encode())
             metadata["source_phonemes"] = "source_phonemes.json"
-        if args.lyrics and not args.orig_lyrics:
-            args.orig_lyrics = transcribe(audio[s0:s1], _device())
         metadata["source_lyrics"] = args.orig_lyrics
         save_metadata()
-        bundle = load_seedvc(_device())
         for index, seed in enumerate(seeds, 1):
             args.seed = seed
             args.plan = None
@@ -1458,6 +1469,17 @@ def cmd_run(args):
                     args.baseline, args.plan, args.baseline_label = False, plan_path, None
                 result["lyrics_only"] = extra
                 save_metadata()
+            if args.lyrics and not args.baseline and args.melody_only:
+                # Reuse the altered melody, with content from the original vocal.
+                print(f"\n[{index}/{args.count}] seed {seed}: original words, new melody")
+                melody_args = argparse.Namespace(**vars(args))
+                melody_args.lyrics = None
+                melody_args.melody_only_label = f"melodyonly_{index:02d}"
+                extra = cmd_render(melody_args, bundle=bundle, source_audio=audio,
+                                   source_phones=source_phones)
+                extra["plan"] = result["plan"]
+                result["melody_only"] = extra
+                save_metadata()
         metadata["source_unchanged"] = sha256(src) == digest
         metadata["status"] = "complete"
         metadata["finished_at"] = datetime.now().astimezone().isoformat()
@@ -1465,7 +1487,8 @@ def cmd_run(args):
     except (Exception, KeyboardInterrupt, SystemExit) as exc:
         metadata["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         metadata["error"] = f"{type(exc).__name__}: {exc}"
-        save_metadata()
+        if folder.is_dir():
+            save_metadata()
         raise
     print(f"\nGenerated {len(metadata['outputs'])} {noun} in {folder}")
 
@@ -1562,6 +1585,9 @@ def main(argv=None):
     q.add_argument("--no-lyrics-only", dest="lyrics_only", action="store_false",
                    help="skip the extra file per variation with the new words on the "
                         "original melody")
+    q.add_argument("--no-melody-only", dest="melody_only", action="store_false",
+                   help="skip the extra file per variation with the original words on the "
+                        "new melody")
     render_opts(q)
     q.set_defaults(func=cmd_run, lyrics="auto")
 

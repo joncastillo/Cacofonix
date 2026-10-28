@@ -29,13 +29,19 @@ the voice sample it uses to match the singer. That sample takes up 8 seconds by
 default, leaving about 22 seconds for the part you want to change.
 
 Cacofonix saves the results in a new folder next to your audio file, named with the
-date and time. You'll find five WAV files, a copy of your original recording, and
+date and time. You'll find five variations with companion WAV files, a copy of your original recording, and
 JSON reports with the settings and timing scores. Add `--count 1` if you only want
 one version, or `--seed 12345` to use the same melody choices when you run it again.
 
 Each version also gets a `lyricsonly_` WAV file: the same gibberish sung on the
 original melody, so you can hear the new words without the new tune. Add
 `--no-lyrics-only` to skip these files.
+
+Each version also gets a `melodyonly_` WAV file: the same altered melody with the
+original lyrics retained. Add `--no-melody-only` to skip these files. Both companion
+files have their own timing reports and metadata entries. With `--keep-lyrics`,
+the main output already preserves the words, so no companion files are added.
+Companion files are also skipped with `--baseline`.
 
 ## Architecture
 

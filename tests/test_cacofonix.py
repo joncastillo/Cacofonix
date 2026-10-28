@@ -28,6 +28,26 @@ class SetupChecks(unittest.TestCase):
 
 
 class AudioChecks(unittest.TestCase):
+    def test_transcribe_uses_whisper_features_without_conflicting_decoder_ids(self):
+        import torch
+        features = torch.zeros((1, 80, 3000))
+        with patch("librosa.resample", return_value=np.zeros(16000)), \
+                patch("transformers.AutoProcessor.from_pretrained") as processor_loader, \
+                patch("transformers.WhisperForConditionalGeneration.from_pretrained") as model_loader:
+            processor = processor_loader.return_value
+            processor.feature_extractor.return_value.input_features = features
+            processor.batch_decode.return_value = ["  sung words  "]
+            model = model_loader.return_value.to.return_value.eval.return_value
+            model.generate.return_value = torch.tensor([[1, 2]])
+
+            result = c.transcribe(np.zeros(c.SR), torch.device("cpu"))
+
+            self.assertEqual(result, "sung words")
+            self.assertIsNone(model.generation_config.forced_decoder_ids)
+            self.assertIsNone(model.config.forced_decoder_ids)
+            model.generate.assert_called_once_with(input_features=features,
+                                                   language="en", task="transcribe")
+
     def test_cleanup_reduces_silence_noise_preserves_active_sound_and_length(self):
         rng = np.random.default_rng(11)
         source = np.zeros(c.SR * 3, dtype=np.float32)
@@ -111,13 +131,17 @@ class BatchChecks(unittest.TestCase):
             return replacement_content, f0, {"tts_seconds": 2.0, "syllables": [
                 {"orig": "bat", "new": "pat", "orig_vowel": 0.2}]}
 
+        def fake_transcribe(*args):
+            self.assertEqual(set(self.out.iterdir()), before)
+            return "bat bat bat"
+
         with contextlib.redirect_stdout(capture), \
                 patch.object(c, "_analysis", side_effect=self.analysis), \
                 patch.object(c, "load_seedvc", return_value=(None, None)) as loader, \
                 patch.object(c, "extract_f0", return_value=np.full(400, 220.0)), \
                 patch.object(c, "envelope", return_value=onsets), \
                 patch.object(c, "recognize_phonemes", return_value=phones), \
-                patch.object(c, "transcribe", return_value="bat bat bat"), \
+                patch.object(c, "transcribe", side_effect=fake_transcribe), \
                 patch.object(c, "kokoro_pipe", return_value=SimpleNamespace(
                     g2p=lambda word: ("bæt", None))), \
                 patch.object(c, "lyrics_conditioning", side_effect=fake_lyrics), \
@@ -134,9 +158,19 @@ class BatchChecks(unittest.TestCase):
             else:
                 c.main(command)
             self.assertEqual(loader.call_count, 1)
-            for call in synthesis.call_args_list:
+            has_companions = "--keep-lyrics" not in extra and "--baseline" not in extra
+            lyrics_only = has_companions and "--no-lyrics-only" not in extra
+            melody_only = has_companions and "--no-melody-only" not in extra
+            renders_per_variant = 1 + lyrics_only + melody_only
+            for index, call in enumerate(synthesis.call_args_list):
+                is_melody_only = melody_only and index % renders_per_variant == renders_per_variant - 1
                 self.assertIs(call.kwargs["content"],
-                              None if "--keep-lyrics" in extra else replacement_content)
+                              None if "--keep-lyrics" in extra or is_melody_only
+                              else replacement_content)
+                if is_melody_only:
+                    main_call = synthesis.call_args_list[index - renders_per_variant + 1]
+                    np.testing.assert_array_equal(call.args[2], main_call.args[2])
+                    self.assertTrue(np.any(call.args[2] != 220.0))
         folder, = set(self.out.iterdir()) - before
         return folder, json.loads((folder / "metadata.json").read_text()), capture.getvalue()
 
@@ -149,7 +183,7 @@ class BatchChecks(unittest.TestCase):
         self.assertEqual(len(set(meta["variant_seeds"])), 5)
         self.assertEqual((folder / meta["source_copy"]).read_bytes(), self.original_bytes)
         self.assertEqual(self.source.read_bytes(), self.original_bytes)
-        self.assertEqual(len(list(folder.glob("*.wav"))), 11)  # 5 + 5 lyrics-only + copy
+        self.assertEqual(len(list(folder.glob("*.wav"))), 16)  # 5 of each version + copy
         self.assertIn(f"Generated 5 mangled melodies in {folder.resolve()}", log)
         self.assertEqual(meta["settings"]["steps"], 50)
         self.assertEqual(meta["settings"]["lyrics"], "auto")
@@ -169,13 +203,33 @@ class BatchChecks(unittest.TestCase):
             self.assertEqual(extra["seed"], output["seed"])
             self.assertEqual(extra["lyrics"]["new_text"], output["lyrics"]["new_text"])
             self.assertTrue((folder / extra["output"]).is_file())
+            melody = output["melody_only"]
+            self.assertIn("melodyonly_", melody["output"])
+            self.assertEqual(melody["seed"], output["seed"])
+            self.assertEqual(melody["plan"], output["plan"])
+            self.assertIsNone(melody["lyrics"])
+            self.assertEqual(melody["output_sha256"], c.sha256(folder / melody["output"]))
+            self.assertTrue((folder / melody["report"]).is_file())
+            samples, sample_rate = sf.read(folder / melody["output"])
+            self.assertEqual(len(samples), len(self.audio))
+            self.assertEqual(sample_rate, c.SR)
 
     def test_lyrics_only_can_be_disabled_and_is_skipped_when_words_are_kept(self):
         for option in ("--no-lyrics-only", "--keep-lyrics"):
             with self.subTest(option=option):
                 folder, meta, _ = self.run_batch(option, "--count", "1")
                 self.assertNotIn("lyrics_only", meta["outputs"][0])
-                self.assertEqual(len(list(folder.glob("*.wav"))), 2)
+                self.assertEqual(len(list(folder.glob("*.wav"))),
+                                 3 if option == "--no-lyrics-only" else 2)
+
+    def test_melody_only_can_be_disabled_and_baseline_skips_companions(self):
+        for options, wav_count in ((("--no-melody-only",), 3),
+                                   (("--no-melody-only", "--no-lyrics-only"), 2),
+                                   (("--keep-lyrics",), 2), (("--baseline",), 2)):
+            with self.subTest(options=options):
+                folder, meta, _ = self.run_batch(*options, "--count", "1")
+                self.assertNotIn("melody_only", meta["outputs"][0])
+                self.assertEqual(len(list(folder.glob("*.wav"))), wav_count)
 
     def test_seed_repeats_plans_and_runs_never_overwrite(self):
         folder1, first, _ = self.run_batch("--seed", "0", "--count", "2")
